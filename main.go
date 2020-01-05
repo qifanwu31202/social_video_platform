@@ -1,19 +1,19 @@
 package main
 
 import (
+	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/gorilla/mux"
+	"github.com/olivere/elastic"
+	"github.com/pborman/uuid"
 	"io"
 	"log"
 	"net/http"
 	"path/filepath"
 	"reflect"
 	"strconv"
-
-	"cloud.google.com/go/storage"
-	"github.com/olivere/elastic"
-	"github.com/pborman/uuid"
 )
 
 const (
@@ -53,11 +53,89 @@ type Post struct {
 
 func main() {
 	fmt.Println("started-service")
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	r := mux.NewRouter()
+
+	r.Handle("/post", http.HandlerFunc(handlerPost)).Methods("POST", "OPTIONS")
+	r.Handle("/search", http.HandlerFunc(handlerSearch)).Methods("GET", "OPTIONS")
+	r.Handle("/cluster", http.HandlerFunc(handlerCluster)).Methods("GET", "OPTIONS")
+
+	log.Fatal(http.ListenAndServe(":8080", r))
+	//http.HandleFunc("/post", handlerPost)
+	//http.HandleFunc("/search", handlerSearch)
+	//http.HandleFunc("/cluster", handlerCluster)
+	//log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+func handlerPost(w http.ResponseWriter, r *http.Request) {
+	// Parse from body of request to get a json object.
+	fmt.Println("Received one post request")
+	w.Header().Set("Content-Type", "application/json")
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+
+	p := &Post{
+		User:    r.FormValue("user"),
+		Message: r.FormValue("message"),
+		Location: Location{
+			Lat: lat,
+			Lon: lon,
+		},
+		Face: 0.0,
+	}
+
+	file, header, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Image is not available", http.StatusBadRequest)
+		fmt.Printf("Image is not available %v\n", err)
+		return
+	}
+
+	id := uuid.New()
+
+	attrs, err := saveToGCS(file, id)
+	if err != nil {
+		http.Error(w, "Failed to save image to GCS", http.StatusInternalServerError)
+		fmt.Printf("Failed to save image to GCS %v\n", err)
+		return
+	}
+	p.Url = attrs.MediaLink
+
+	//id := uuid.New()
+	suffix := filepath.Ext(header.Filename)
+	if t, ok := mediaTypes[suffix]; ok {
+		p.Type = t
+	} else {
+		p.Type = "unknown"
+	}
+
+	if p.Type == "image" {
+		uri := fmt.Sprintf("gs://%s/%s", BUCKET_NAME, id)
+		if score, err := annotate(uri); err != nil {
+			http.Error(w, "Failed to annotate the image", http.StatusInternalServerError)
+			fmt.Printf("Failed to annotate the image %v\n", err)
+			return
+		} else {
+			p.Face = score
+		}
+	}
+
+	err = saveToES(p, POST_INDEX, id)
+	if err != nil {
+		http.Error(w, "Failed to save post to Elasticsearch", http.StatusInternalServerError)
+		fmt.Printf("Failed to save post to Elasticsearch %v\n", err)
+		return
+	}
+}
+
+/***
 func handlerPost(w http.ResponseWriter, r *http.Request) {
 	// Parse from body of request to get a json object.
 	// Parse from body of request to get a json object.
@@ -100,6 +178,17 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	}
 	p.Url = attrs.MediaLink
 
+	if p.Type == "image" {
+		uri := fmt.Sprintf("gs://%s/%s", BUCKET_NAME, id)
+		if score, err := annotate(uri); err != nil {
+			http.Error(w, "Failed to annotate the image", http.StatusInternalServerError)
+			fmt.Printf("Failed to annotate the image %v\n", err)
+			return
+		} else {
+			p.Face = score
+		}
+	}
+
 	err = saveToES(p, POST_INDEX, id)
 	if err != nil {
 		http.Error(w, "Failed to save post to Elasticsearch", http.StatusInternalServerError)
@@ -109,11 +198,19 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("Post is done successfully: %s\n", p.Message)
 
 }
+***/
 
 func handlerSearch(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Received one request for search")
 
 	w.Header().Set("Content-Type", "application/json")
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
 
 	lat, _ := strconv.ParseFloat(r.URL.Query().Get("lat"), 64)
 	lon, _ := strconv.ParseFloat(r.URL.Query().Get("lon"), 64)
@@ -140,6 +237,38 @@ func handlerSearch(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("Failed to parse posts into JSON format %v.\n", err)
 		return
 	}
+	w.Write(js)
+}
+
+func handlerCluster(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Received one cluster request")
+	w.Header().Set("Content-Type", "application/json")
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
+
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	term := r.URL.Query().Get("term")
+	query := elastic.NewRangeQuery(term).Gte(0.9)
+
+	searchResult, err := readFromES(query, POST_INDEX)
+	if err != nil {
+		http.Error(w, "Failed to read post from Elasticsearch", http.StatusInternalServerError)
+		fmt.Printf("Failed to read post from Elasticsearch %v.\n", err)
+		return
+	}
+	posts := getPostFromSearchResult(searchResult)
+
+	js, err := json.Marshal(posts)
+	if err != nil {
+		http.Error(w, "Failed to parse post object", http.StatusInternalServerError)
+		fmt.Printf("Failed to parse post object %v\n", err)
+		return
+	}
+
 	w.Write(js)
 }
 
